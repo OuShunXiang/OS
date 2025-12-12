@@ -770,24 +770,19 @@ int ProcessPath(char* path, char*& Name, int k, int n, char attrib)
 
 /////////////////////////////////////////////////////////////////
 
-int MdComd(int k)		//md命令处理函数
+int MdComd(int k)			//md命令，创建子目录 
 {
-	// 命令形式：md <目录名>
-	// 功能：在指定路径下创建指定目录，若没有指定路径，则在当前目录下创建指定目录。
-	// 对于重名目录给出错误信息。目录与文件也不能重名。
-
-	// 学生可以考虑命令中加“属性”参数，用于创建指定属性的子目录。命令形式如下：
-	//		md <目录名>[ <属性>]
-	// 属性包括R、H、S以及它们的组合(不区分大小写，顺序也不限)。例如：
-	//		md user rh
-	// 其功能是在当前目录中创建具有“只读”和“隐藏”属性的子目录user。
-
-	short i, s, s0, kk;
-	char attrib = (char)16, * DirName;
-	FCB* p;
-
-	kk = SIZE / sizeof(FCB);
-
+	// 命令形式：md <目录名>[ <属性>]
+	// 命令功能：创建指定的子目录，若该目录已存在，则给出错误信息。
+	//          md bin	 
+	// 上述命令创建子目录bin
+	// md bin |h
+	// 上述命令创建具有隐藏属性的子目录bin
+	short i, s, s0;
+	char attrib = (char)16; //16表示目录，用于创建目录时指定属性
+	char* DirName;
+	FCB* fcbp, * p;
+	short kk = SIZE / sizeof(FCB);
 	if (k < 1)
 	{
 		cout << "\n错误：命令中没有目录名。\n";
@@ -799,36 +794,40 @@ int MdComd(int k)		//md命令处理函数
 		return -1;
 	}
 	s = ProcessPath(comd[1], DirName, k, 0, attrib);
-	if (s < 0)
-		return s;		//失败，返回
-	if (!IsName(DirName))		//若名字不符合规则
+	if (s < 0) return s;	//失败，返回
+	if (!IsName(DirName))	//若名字不符合规则
 	{
 		cout << "\n命令中的新目录名错误。\n";
 		return -1;
 	}
-	i = FindFCB(DirName, s, attrib, p);
+
+	i = FindFCB(DirName, s, (char)32, p); // 检查是否存在同名文件或目录
+
 	if (i > 0)
 	{
-		cout << "\n错误：目录重名！\n";
+		// 统一修改错误提示信息
+		cout << "\n错误：目录与现有目录或文件重名！\n";
 		return -1;
 	}
-	if (k == 2)		//命令形式：md <目录名> |<属性符>
+
+
+	if (k == 2) //命令形式：md <目录名> |<属性符>
 	{
 		i = GetAttrib(comd[2], attrib);
-		if (i < 0)
-			return i;
+		if (i < 0) return i;
 	}
 	s0 = FindBlankFCB(s, p);//找空白目录项
-	if (s0 < 0)			//磁盘满
+	if (s0 < 0)				//磁盘满
 		return s0;
 	s0 = M_NewDir(DirName, p, s, attrib);	//在p所指位置创建一新子目录项
-	if (s0 < 0)		//创建失败
+	if (s0 < 0)				//创建失败
 	{
 		cout << "\n磁盘空间已满，创建目录失败。\n";
 		return -1;
 	}
-	return 1;		//新目录创建成功，返回
+	return 1;				
 }
+
 
 /////////////////////////////////////////////////////////////////
 
@@ -2849,16 +2848,16 @@ void releaseblock(short s)	//回收磁盘空间
 
 /////////////////////////////////////////////////////////////////
 
-int ParseCommand(char* p)	//将输入的命令行分解成命令和参数等
+int ParseCommand(char* p)	//将命令行分解为命令和参数
 {
 	int i, j, k, g = 0;
 	for (i = 0; i < CK; i++)					//初始化comd[][] 
 		comd[i][0] = '\0';
 	for (k = 0; k < CK; k++)
-	{	//分解命令及其参数，comd[0]中是命令，comd[1],comd[2]...是参数
+	{	//分解命令及参数，comd[0]为命令，comd[1],comd[2]...为参数
 		for (i = 0; *p != '\0'; i++, p++)
-			if (*p != ' ')				//空格是命令、参数之间的分隔符
-				comd[k][i] = *p;		//取命令标识符
+			if (*p != ' ')				//以空格为界
+				comd[k][i] = *p;		//取标识符
 			else
 			{
 				comd[k][i] = '\0';
@@ -2872,19 +2871,28 @@ int ParseCommand(char* p)	//将输入的命令行分解成命令和参数等
 			break;
 		}
 	}
+
 	for (i = 0; comd[0][i] != '\0'; i++)
-		if (comd[0][i] == '/')		//处理cd/，dir/usr等情况
+	{
+		if (comd[0][i] == '/' || comd[0][i] == '.' || comd[0][i] == '>' || comd[0][i] == '<')
 			break;
-	if (comd[0][i] != '\0')			//comd[0]中存在字符'/'
+	}
+
+	if (comd[0][i] != '\0')			//如果comd[0]中扫描到了分隔符
 	{
 		if (k > 0)
 			for (j = k; j > 0; j--)
-				strcpy(comd[j + 1], comd[j]);	//后移
-		strcpy(comd[1], &comd[0][i]);
-		comd[0][i] = '\0';
-		k++;	//多出一个参数
+				strcpy(comd[j + 1], comd[j]);	//将已有的后续参数向后移动一位
+
+		strcpy(comd[1], &comd[0][i]);   //将分隔符及之后的内容作为第一个参数(comd[1])
+		comd[0][i] = '\0';              //截断comd[0]，只保留命令名
+		k++;	                        //参数个数计数加1
 	}
 	return k;
 }
 
+
 /////////////////////////////////////////////////////////////////
+
+
+
