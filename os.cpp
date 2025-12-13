@@ -172,7 +172,8 @@ int buffer_to_file(FCB* fcbp, char* Buffer);	//Buffer写入文件
 int file_to_buffer(FCB* fcbp, char* Buffer);	//文件内容读到Buffer,返回文件长度
 int ParseCommand(char*);		//将输入的命令行分解成命令和参数等
 void ExecComd(int);				//执行命令
-
+int MoveComd(int);				//move命令处理函数, 移动文件或重命名目录
+int BatchComd(int);			//batch命令处理函数, 批处理命令文件中的命令
 #define INIT	//决定初始化还是从磁盘读入
 
 int main(void)
@@ -405,7 +406,7 @@ void ExecComd(int k)		//执行命令
 	char CmdTab[][COMMAND_LEN] = { "create","open","write","read","close",
 		"del","dir","cd","md","rd","ren","copy","type","help","attrib",
 		"uof","closeall","block","rewind","fseek","fat","check","exit",
-		"undel","Prompt","udtab" };
+		"undel","Prompt","udtab","move","batch" };
 	int M = sizeof(CmdTab) / COMMAND_LEN;	//统计命令个数
 	for (cid = 0; cid < M; cid++)			//在命令表中检索命令
 		if (_stricmp(CmdTab[cid], comd[0]) == 0)//命令不区分大小写
@@ -465,6 +466,10 @@ void ExecComd(int k)		//执行命令
 		break;
 	case 25:UdTabComd();		//udtab命令，显示被删除文件表(调试程序用)
 		break;
+	case 26:MoveComd(k);		//move命令，移动文件或重命名目录
+		break;
+	case 27:BatchComd(k);		//batch命令，批处理命令文件中的命令
+		break;
 	default:cout << "\n命令错:" << comd[0] << endl;
 	}
 }
@@ -498,6 +503,8 @@ void HelpComd()				//help命令，帮助信息(显示各命令格式)
 	cout << "prompt                                  ——提示符是否显示当前目录(切换)。\n";
 	cout << "fat                                     ——显示FAT表中空闲盘块数(0的个数)。\n";
 	cout << "check                                   ——核对后显示FAT表中空闲盘块数。\n";
+	cout << "move <文件名> <目录名>                  ——移动文件或重命名子目录。\n";
+    cout << "batch <文件名>                          ——批处理执行文件中的命令。\n";
 }
 
 /////////////////////////////////////////////////////////////////
@@ -1401,13 +1408,48 @@ int WriteComd(int k)		//write命令的处理函数
 		ins = 0;						//这种情况不会是插入方式
 	}
 
-	pos--;							//使pos从0开始
+    pos--;							//使pos从0开始
 
-	cout << "\n请输入写入文件的内容(最多允许输入" << sizeof(Buffer) - 1 << "个字节)：\n";
-	cin.getline(Buffer, BSIZE);
-	len1 = strlen(Buffer);
-	if (len1 == 0)			//输入长度为0,不改变文件
-		return 0;
+    cout << "\n请输入写入文件的内容 (输入完成后，另起一行输入 :q 并回车结束)：\n";
+    
+    // 初始化缓冲区
+    Buffer[0] = '\0';
+    char tempLine[INPUT_LEN]; // 用于暂存每一行输入
+    int current_len = 0;
+
+    while (true)
+    {
+        // 读取一行
+        cin.getline(tempLine, INPUT_LEN);
+
+        // 检查是否是结束标记 (这里设定为 :q)
+        if (strcmp(tempLine, ":q") == 0)
+            break;
+
+        // 检查缓冲区是否溢出
+        int lineLen = strlen(tempLine);
+        if (current_len + lineLen + 2 >= BSIZE) // +2 是为了留给 \n 和 \0
+        {
+            cout << "警告：输入内容过长，后续内容已被截断。\n";
+            break;
+        }
+
+        // 将这一行拼接到主缓冲区
+        strcat(Buffer, tempLine);
+        
+        // 【关键】手动添加换行符，因为 cin.getline 会吃掉换行符
+        // 这样存入文件时，就有真正的换行了，Batch 命令读取时也能识别
+        strcat(Buffer, "\n"); 
+        
+        current_len += (lineLen + 1);
+    }
+    
+    len1 = strlen(Buffer); // 更新最终长度
+    // 去掉最后一个多余的换行符（可选，看你是否希望文件末尾有空行）
+    // if (len1 > 0 && Buffer[len1-1] == '\n') { Buffer[len1-1] = '\0'; len1--; }
+
+    if (len1 == 0)			//输入长度为0,不改变文件
+        return 0;
 	fcbp = uof[ii_uof].fp;
 	len0 = uof[ii_uof].fsize;				//取文件原来的长度值
 	if (len0 == 0)						//若是空文件
@@ -2419,6 +2461,212 @@ int RewindComd(int k)	//rewind命令的处理函数：读、写指针移到文�
 }
 
 /////////////////////////////////////////////////////////////////
+int MoveComd(int k){
+	// move <文件名> <目录名>
+    // s1: 源文件/目录所在父目录的首块号
+    // s2: 目标目录的首块号
+	short s1, s2, s_src, s_dst, i;
+    char *Name1, *Name2; // Name1是源文件名，Name2是目标目录名
+    char attrib = '\0';
+    char yn;
+    FCB *fcbp_src, *fcbp_dst, *fcbp_new;
+
+	if (k!=2)
+	{
+		cout << "\n命令中参数个数错误。格式:move<source><destination>\n";
+		return -1;
+	}
+
+	// 解析源文件/目录
+	s1 = ProcessPath(comd[1], Name1, k, 0, '\20');//取Name1所在目录的首块号
+	short temp_parent; char* temp_name;
+	temp_parent = ProcessPath(comd[2], temp_name, k, 0, '\20');
+	bool mayRename = (temp_parent == s1); // 目标路径的父目录和源文件/目录的父目录相同，可能是改名操作
+
+	if(s1<1){
+		return s1; //路径错误
+	}
+
+	// 获取源FCB,检查存在性
+	s_src = FindFCB(Name1, s1, attrib, fcbp_src);		//取Name1的首块号(查其存在性)
+	if (s_src < 0 && !mayRename){
+		cout << "\n要移动的文件或目录不存在。\n";
+		return -1;
+	}
+	// 检查源是否打开（if File)
+	char srcFullPath[PATH_LEN];
+	strcpy(srcFullPath, temppath);
+	if(srcFullPath[strlen(srcFullPath) - 1] != '/') {
+		strcat(srcFullPath, "/");
+	}
+	strcat(srcFullPath, Name1);	//构造源文件/目录的全路径名
+	if(fcbp_src->Fattrib<= '\07'){
+		if(Check_UOF(srcFullPath) < S){
+			cout << "\n文件" << srcFullPath << "正在使用呢,请保存文件关闭后再试!\n";
+			return -1;
+		}
+	}
+	// 解析目标目录
+	s2 = FindPath(comd[2], '\020', 1, fcbp_dst);		// s2: 目标目录的首块号
+
+
+	// Case 1: 目标是目录且已经存在，那么咱们就来做移动
+
+	if(s2 > 0 && (fcbp_dst->Fattrib & '\20')){ //目标存在且是目录
+
+		// 检查目标目录下是否有同名文件/目录
+		short exist = FindFCB(Name1, s2, attrib, fcbp_new);
+
+		if(exist >= 0){ //目标目录下有同名项
+
+		    // 目录不能覆盖目录
+		   if((fcbp_src->Fattrib & '\20') && (fcbp_new->Fattrib & '\20')){
+			   cout << "\n错误:目标目录下已有同名子目录，无法覆盖。\n";
+			   return -1;
+		   } 
+
+		   if(fcbp_src->Fattrib <= '\07') {  // 源是文件
+                if(fcbp_new->Fattrib & '\20') // 目标是目录
+                {
+                     cout << "\n错误：不能用文件覆盖同名目录。\n";
+                     return -1;
+                }
+                // 都是文件，询问覆盖
+                cout << "\n存在同名文件，是否要覆盖它？(Yes/No) ";
+                cin >> yn;
+                if(yn != 'y' && yn != 'Y') return 0;
+                
+                // 覆盖操作：其实就是把目标删了，再把源搬过去
+                releaseblock(fcbp_new->Addr);
+                // 此时 fcbp_new 指向的是目标目录里的那个同名FCB，直接用源FCB覆盖它
+                *fcbp_new = *fcbp_src; // 复制FCB         
+                // 清除源目录项
+                fcbp_src->FileName[0] = (char)0xe5; 
+                cout << "\n文件移动并覆盖成功。\n";
+                return 1;
+            }
+		}
+
+		// 没有重名，直接移动
+		//在磁盘中目标目录s2块中找空目录项
+		if(FindBlankFCB(s2,fcbp_new) < 0){
+			return -1; // 目标目录满
+		}
+
+		*fcbp_new = *fcbp_src; // 复制FCB
+		fcbp_src->FileName[0] = (char)0xe5; // 清除源目录项
+
+		// 如果移动子目录，需更新子目录里的.. 目录项指向新的父目录
+		if(fcbp_new->Fattrib & '\20'){
+			short sub_block  = fcbp_new->Addr;
+			FCB* sub_fcb = (FCB*)Disk[sub_block];
+			sub_fcb++; // 指向第二个目录项，即..
+			if(strcmp(sub_fcb->FileName, "..") == 0){
+				sub_fcb->Addr = s2; // 更新为新父目录块号
+			}
+		}
+		cout<<"\n移动成功。\n";
+		return 1;
+	}
+	// Case 2: 目标不存在，需要给子目录改名OR路径错误（move lin chen)
+
+    short s2_parent = ProcessPath(comd[2], Name2, k, 0, '\20');//取Name2所在目录的首块号
+
+	if(s2_parent<1) { //目标路径不合法
+		cout<<"\n目标路径错误。\n";
+		return -1;
+	}
+	if(s2_parent==s1){
+		if(fcbp_src->Fattrib <='\07'){ //源是文件
+			cout << "\nMove命令不能用于文件改名，请使用 Ren 命令。\n";
+            return -1;
+		} else {
+			// 源是目录，改名操作
+			if(!IsName(Name2)){
+				cout<<"\n新目录名不合法。\n";
+				return -1;
+			}
+			if(FindFCB(Name2,s1,attrib,fcbp_dst)>=0){
+				cout << "\n 重名，无法改名。\n";
+				return -1;
+			}
+			strcpy(fcbp_src->FileName,Name2);
+			cout<<"\n目录改名成功。\n";
+			return 1;
+		}
+	} else {
+		cout<<"\n目标目录不存在，无法移动。\n";
+		return -1;
+	}
+	return 1;
+}
+
+int BatchComd(int k){
+	// batch <脚本文件名>
+	// 逐行读取文件内容，调用ParseCommand and ExecComd
+
+	short s, i, length;
+	char attrib = '\0', * FileName;
+	FCB* fcbp;
+	char *FileBuffer;
+	char lineCmd[INPUT_LEN];
+
+	if(k!=1){
+		cout<<"\n命令参数错误。格式:batch <脚本文件名>\n";
+		return -1;
+	}
+	// <1>先找到文件
+	s = ProcessPath(comd[1], FileName, k, 0, '\20');//取FileName所在目录的首块号
+	if(s<1){
+		return s; //路径错误
+	}
+	short s_file = FindFCB(FileName, s, attrib, fcbp);	//取FileName的首块号(查其存在性)
+	if(s_file < 0){
+		cout << "\n脚本文件不存在。\n";
+		return -1;
+	}
+	if(fcbp->Fsize==0){
+		cout << "\n批处理文本为空\n";
+		return 1;
+	}
+	// <2>读取文件内容到缓冲区
+	FileBuffer = new char[fcbp->Fsize + 1];
+	file_to_buffer(fcbp, FileBuffer);
+
+	// <3>逐行解析执行
+	int bufferIndex = 0;
+	int lineIndex = 0;
+	int cmdCount = 0;
+	int fileSize = fcbp->Fsize;
+
+	while(bufferIndex<fileSize){
+		lineIndex = 0;
+		while(bufferIndex<fileSize && FileBuffer[bufferIndex]!='\n'&& FileBuffer[bufferIndex]!='\r'){
+			if(lineIndex<INPUT_LEN-1) {
+				lineCmd[lineIndex++] = FileBuffer[bufferIndex];
+			}
+			bufferIndex++;
+		}
+		lineCmd[lineIndex] = '\0';
+		// 跳过换行符
+		while(bufferIndex< fileSize &&(FileBuffer[bufferIndex] == '\n' || FileBuffer[bufferIndex] == '\r')){
+			bufferIndex++;
+		}
+		if(strlen(lineCmd)==0){
+			continue; //空行跳过
+		}
+		cout<<"\n[Batch Execute]: "<<lineCmd<<endl;
+	    //<4> 执行命令
+		char tempLine[INPUT_LEN];
+		strcpy(tempLine, lineCmd);
+		int k_arguments = ParseCommand(tempLine);
+		ExecComd(k_arguments);
+		cmdCount++;
+	}
+	delete[] FileBuffer;
+	cout<<"\n批处理执行完毕，共执行 "<<cmdCount<<" 条命令。\n";
+	return 1;
+}
 
 void UofComd()	//uof命令，显示当前用户“打开文件表”
 {
@@ -2890,8 +3138,6 @@ int ParseCommand(char* p)	//将命令行分解为命令和参数
 	}
 	return k;
 }
-
-
 /////////////////////////////////////////////////////////////////
 
 
